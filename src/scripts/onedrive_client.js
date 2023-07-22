@@ -357,6 +357,17 @@ class OneDriveClient {
             }
         }, errorCallback).fetch();
     }
+  
+    function getOfficeOnlineUrl(fileId, fileExtension) {
+      const officeOnlineExtensions = ["docx", "doc", "pptx", "ppt", "xlsx", "xls"];
+      const extensionIndex = officeOnlineExtensions.indexOf(fileExtension);
+      if (extensionIndex !== -1) {
+        const appNames = ["Word", "Word", "PowerPoint", "PowerPoint", "Excel", "Excel"];
+        return `https://office.live.com/start/${appNames[extensionIndex]}.aspx?src=${encodeURIComponent(`https://graph.microsoft.com/v1.0/me/drive/items/${fileId}/content`)}`;
+      } else {
+        return null;
+      }
+    }
 
     readDirectory(path, successCallback, errorCallback) {
         const fetchingListFolderObject = this.createFetchingListFolderObject(path === '/' ? '' : path);
@@ -370,8 +381,13 @@ class OneDriveClient {
     }
 
     openFile(filePath, requestId, mode, successCallback, _errorCallback) {
+      const isOfficeOnlineFile = getOfficeOnlineUrl(file.id, fileExtension);
+      if (isOfficeOnlineFile) {
+        window.open(isOfficeOnlineFile, "_blank");
+      } else {
         this.writeRequestMap[requestId] = {};
-        successCallback();
+      }
+      successCallback();
     };
 
     closeFile(filePath, openRequestId, mode, successCallback, errorCallback) {
@@ -579,31 +595,75 @@ class OneDriveClient {
             metadata.size < 20971520 &&
             extPattern.test(metadata.name);
     }
+  
+    async function startUploadSession(token, filePath) {
+      const maxFileSize = 250 * 1024 * 1024 * 1024; // 250 GB in bytes
+      const maxChunkSize = 60 * 1024 * 1024; // 60 MB in bytes
+
+      const fileSize = fs.statSync(filePath).size;
+      if (fileSize > maxFileSize) {
+        throw new Error('File size exceeds maximum allowed size');
+      }
+
+      const fileName = path.basename(filePath);
+      let url = ONEDRIVE_API_URL + '/drive/root:/' + encodeURIComponent(fileName) + ':/createUploadSession';
+      let headers = {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json'
+      };
+      let data = {
+        item: {
+          "@microsoft.graph.conflictBehavior": "rename"
+        }
+      };
+
+      // Check remaining available storage on OneDrive
+      await checkAvailableStorage(headers, fileSize);
+
+      let response = await axios.post(url, data, {headers});
+
+      let uploadUrl = response.data.uploadUrl;
+      let sessionId = response.data.id;
+
+      const chunks = await calculateNumberOfChunks(fileSize, maxChunkSize);
+
+      return {
+        uploadUrl,
+        fileName,
+        fileSize,
+        sessionId,
+        chunkSize: maxChunkSize,
+        chunks
+      };
+    }  
         
-    startUploadSession(filePath, successCallback, errorCallback) {
-        const reqData = this.jsonStringify({
-            close: false
+    calculateNumberOfChunks(fileSize, maxChunkSize) {
+      const numChunks = Math.ceil(fileSize / maxChunkSize);
+      const chunks = [];
+      let start = 0;
+      for (let i = 0; i < numChunks; i++) {
+        const size = Math.min(maxChunkSize, fileSize - start);
+        chunks.push({
+          index: i,
+          size,
+          start,
+          end: start + size - 1,
         });
-        console.log('STARTINGUPLOADSESSION');
-        console.log(this);
-        new HttpFetcher(this, 'startUploadSession', {
-            type: 'POST',
-            url: "https://graph.microsoft.com/v1.0/me/drive/root:/" + filePath + ":/createUploadSession",
-            headers: {
-                'Authorization': 'Bearer ' + this.access_token_,
-                'Content-Type': 'application/json'
-            },
-            item: {
-                "@odata.type": "microsoft.graph.driveItemUploadableProperties",
-                "@microsoft.graph.conflictBehavior": "replace"
-            },
-        }, reqData, result => {
-            console.log('creating upload session');
-            console.log(result);
-            successCallback(result.uploadUrl);
-        }, errorCallback).fetch();
+        start += size;
+      }
+      return chunks;
     }
 
+    async function checkAvailableStorage(headers, fileSize) {
+      let quotaUrl = ONEDRIVE_API_URL + '/drive?select=quota';
+      let quotaResponse = await axios.get(quotaUrl, {headers});
+      let remainingStorage = quotaResponse.data.quota.remaining;
+
+      if (fileSize > remainingStorage) {
+        throw new Error('Not enough available storage to upload file');
+      }
+    }  
+  
     sendContents(options, successCallback, errorCallback) {
         if (!options.hasMore) {
             successCallback();
@@ -646,105 +706,7 @@ class OneDriveClient {
             }, errorCallback);
         }
     };
-
-    /*
-    startSimpleUpload(options, successCallback, errorCallback) {
-        const data = this.jsonStringify({
-            close: false
-        });
-        new HttpFetcher(this, 'startSimpleUpload', {
-            type: 'PUT',
-            url: "https://graph.microsoft.com/v1.0/me/drive/root:" + options.filePath + ":/content",
-            headers: {
-                'Authorization': 'Bearer ' + this.access_token_,
-                'Content-Type': 'application/octet-stream'
-            },
-            processData: false,
-            data: options.data,
-            dataType: 'json'
-        }, data, result => {
-            console.log('uploading via sumpleupload');
-            console.log(result);
-            const sessionId = result.session_id;
-            successCallback(sessionId);
-        }, errorCallback).fetch();
-    }
-    */
-
-    /*
-    sendContents(options, successCallback, errorCallback) {
-        if (!options.hasMore) {
-            if (options.needCommit) {
-                const data1 = this.jsonStringify({
-                    cursor: {
-                        session_id: options.uploadId,
-                        offset: options.offset
-                    },
-                    commit: {
-                        path: options.filePath,
-                        mode: 'overwrite'
-                    }
-                });
-                new HttpFetcher(this, 'sendContents(1)', {
-                    type: 'POST',
-                    url: 'https://content.onedriveapi.com/2/files/upload_session/finish',
-                    data: new ArrayBuffer(),
-                    headers: {
-                        'Authorization': 'Bearer ' + this.access_token_,
-                        'Content-Type': 'application/octet-stream',
-                        'OneDrive-API-Arg': data1
-                    },
-                    dataType: 'json'
-                }, data1, _result => {
-                    successCallback();
-                }, errorCallback).fetch();
-            } else {
-                successCallback();
-            }
-        } else {
-            const len = options.data.byteLength;
-            const remains = len - options.sentBytes;
-            const sendLength = Math.min(CHUNK_SIZE, remains);
-            const more = (options.sentBytes + sendLength) < len;
-            const sendBuffer = options.data.slice(options.sentBytes, sendLength);
-            const data2 = this.jsonStringify({
-                cursor: {
-                    session_id: options.uploadId,
-                    offset: options.offset
-                },
-                close: false
-            });
-            new HttpFetcher(this, 'sendContents(2)', {
-                type: 'POST',
-                url: 'https://content.onedriveapi.com/2/files/upload_session/append_v2',
-                dataType: 'json',
-                headers: {
-                    'Authorization': 'Bearer ' + this.access_token_,
-                    'Content-Type': 'application/octet-stream',
-                    'OneDrive-API-Arg': data2
-                },
-                processData: false,
-                data: sendBuffer
-            }, data2, _result => {
-                const writeRequest = this.writeRequestMap[options.openRequestId];
-                if (writeRequest) {
-                    writeRequest.offset = options.offset + sendLength;
-                }
-                const req = {
-                    filePath: options.filePath,
-                    data: options.data,
-                    offset: options.offset + sendLength,
-                    sentBytes: options.sendBytes + sendLength,
-                    uploadId: options.uploadId,
-                    hasMore: more,
-                    needCommit: options.needCommit,
-                    openRequestId: options.openRequestId
-                };
-                this.sendContents(req, successCallback, errorCallback);
-            }, errorCallback).fetch();
-        }
-    } */
-
+    
     doCopyEntry(operation, sourcePath, targetPath, successCallback, errorCallback) {
 	// Cut source and target directories to final path slash
         var sourceDir = sourcePath.substring(0, sourcePath.lastIndexOf("/"));
